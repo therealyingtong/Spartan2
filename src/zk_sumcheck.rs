@@ -22,47 +22,97 @@ use tracing::{info, info_span};
 /// 4 k elements is a good cut-off on a 16-core machine.
 const PAR_THRESHOLD: usize = 4 << 10; // 4096
 
-// FIXME this is currently quadratic time, can do linear time if we do incremental products
-fn decompress_and_evaluate_lc_poly<F: PrimeField>(
-  degree_bound: usize,
-  lc_poly: &mut Vec<F>,
-  eval_point: F,
-) {
-  let if_deg_3 = |value: F| {
-    if degree_bound == 3 { value } else { F::ONE }
-  };
+/// Builder for LC polynomial with deferred multiplications.
+///
+/// Stores per-round coefficients and L₁ values, then applies suffix
+/// products at finalize. Runs in O(n) total time.
+struct LCPolyBuilder<F: PrimeField> {
+  /// Coefficients grouped by round (2-3 coefficients per round)
+  coeffs_per_round: Vec<Vec<F>>,
+  /// L_1 values from each round, used for suffix product computation
+  l_1_values: Vec<F>,
+}
 
-  // lc is a vec of coefficients for the mask values
-  // implicitly allocate masks onto lc
-  // Compute lagrange coeffs in eval_point
-  let zero = F::ZERO;
-  let one = F::ONE;
-  let two = F::from(2);
-  let three = F::from(3);
+impl<F: PrimeField> LCPolyBuilder<F> {
+  fn new() -> Self {
+    Self {
+      coeffs_per_round: Vec::new(),
+      l_1_values: Vec::new(),
+    }
+  }
 
-  let C_0 = (zero - one) * (zero - two) * if_deg_3(zero - three);
-  let L_0 =
-    (eval_point - one) * (eval_point - two) * if_deg_3(eval_point - three) * C_0.invert().unwrap();
+  /// Add coefficients for a new round
+  fn add_round(&mut self, degree_bound: usize, eval_point: F) {
+    let if_deg_3 = |value: F| {
+      if degree_bound == 3 { value } else { F::ONE }
+    };
 
-  let C_1 = (one) * (one - two) * if_deg_3(one - three);
-  let L_1 =
-    (eval_point) * (eval_point - two) * if_deg_3(eval_point - three) * C_1.invert().unwrap();
+    // Compute lagrange coeffs in eval_point
+    let zero = F::ZERO;
+    let one = F::ONE;
+    let two = F::from(2);
+    let three = F::from(3);
 
-  let C_2 = (two) * (two - one) * if_deg_3(two - three);
-  let L_2 =
-    (eval_point) * (eval_point - one) * if_deg_3(eval_point - three) * C_2.invert().unwrap();
+    let C_0 = (zero - one) * (zero - two) * if_deg_3(zero - three);
+    let L_0 = (eval_point - one)
+      * (eval_point - two)
+      * if_deg_3(eval_point - three)
+      * C_0.invert().unwrap();
 
-  let C_3 = (three) * (three - one) * (three - two);
-  let L_3 = (eval_point) * (eval_point - one) * (eval_point - two) * C_3.invert().unwrap();
+    let C_1 = (one) * (one - two) * if_deg_3(one - three);
+    let L_1 =
+      (eval_point) * (eval_point - two) * if_deg_3(eval_point - three) * C_1.invert().unwrap();
 
-  // new_lc = L_0 * mask_0 + L_1 * (old_lc - mask_0) + L_2 * mask_2 + L_3 * mask_3
-  // new_lc = L_1 * old_lc + (L_0 - L_1) * mask_0 + L_2 * mask_2 + L_3 * mask_3
-  lc_poly.iter_mut().for_each(|coeff| *coeff *= L_1);
-  lc_poly.push(L_0 - L_1); // mask_0 coeff
-  lc_poly.push(L_2); // mask_2 coeff
+    let C_2 = (two) * (two - one) * if_deg_3(two - three);
+    let L_2 =
+      (eval_point) * (eval_point - one) * if_deg_3(eval_point - three) * C_2.invert().unwrap();
 
-  if degree_bound == 3 {
-    lc_poly.push(L_3); // mask_3 coeff
+    let C_3 = (three) * (three - one) * (three - two);
+    let L_3 = (eval_point) * (eval_point - one) * (eval_point - two) * C_3.invert().unwrap();
+
+    // Store coefficients for this round
+    let mut round_coeffs = Vec::with_capacity(if degree_bound == 3 { 3 } else { 2 });
+    round_coeffs.push(L_0 - L_1);
+    round_coeffs.push(L_2);
+    if degree_bound == 3 {
+      round_coeffs.push(L_3);
+    }
+
+    self.coeffs_per_round.push(round_coeffs);
+    self.l_1_values.push(L_1);
+  }
+
+  /// Finalize the LC polynomial by computing suffix products and applying them.
+  /// This is O(n) total instead of O(n²).
+  fn finalize(self) -> Vec<F> {
+    let num_rounds = self.l_1_values.len();
+    if num_rounds == 0 {
+      return Vec::new();
+    }
+
+    // Pre-reserve exact capacity: degree 2 → 2*n, degree 3 → 3*n
+    let coeffs_per_round = self.coeffs_per_round[0].len();
+    let mut result = Vec::with_capacity(coeffs_per_round * num_rounds);
+
+    // Compute suffix products from right to left: suffix[i] = Π_{j>i} L_1[j]
+    let mut suffix_product = F::ONE;
+    let mut suffix_products = vec![F::ONE; num_rounds];
+    for i in (0..num_rounds).rev() {
+      suffix_products[i] = suffix_product;
+      if i > 0 {
+        suffix_product *= self.l_1_values[i];
+      }
+    }
+
+    // Stream out coefficients in order, applying suffix products
+    for (round_idx, round_coeffs) in self.coeffs_per_round.into_iter().enumerate() {
+      let scale = suffix_products[round_idx];
+      for coeff in round_coeffs {
+        result.push(coeff * scale);
+      }
+    }
+
+    result
   }
 }
 
@@ -138,7 +188,7 @@ impl<E: Engine> SumcheckProof<E> {
     vals.push(claim);
     let (_verify_span, verify_t) = start_span!("sumcheck_verify");
     let mut e = claim;
-    let mut lc_poly = vec![];
+    let mut lc_builder = LCPolyBuilder::new();
 
     let mut r: Vec<E::Scalar> = Vec::new();
 
@@ -171,13 +221,14 @@ impl<E: Engine> SumcheckProof<E> {
 
       // evaluate the claimed degree-ell polynomial at r_i
       e = poly.evaluate(&r_i);
-      decompress_and_evaluate_lc_poly(degree_bound, &mut lc_poly, r_i);
+      lc_builder.add_round(degree_bound, r_i);
 
       if round_t.elapsed().as_millis() > 0 {
         info!(elapsed_ms = %round_t.elapsed().as_millis(), "sumcheck_verify_round");
       }
     }
 
+    let lc_poly = lc_builder.finalize();
     info!(elapsed_ms = %verify_t.elapsed().as_millis(), "sumcheck_verify");
     Ok((e, r, lc_poly))
   }
@@ -258,7 +309,7 @@ impl<E: Engine> SumcheckProof<E> {
     // }
 
     let mut r: Vec<E::Scalar> = Vec::new();
-    let mut lc_poly = vec![];
+    let mut lc_builder = LCPolyBuilder::new();
 
     let mut polys: Vec<CompressedUniPoly<E::Scalar>> = Vec::new();
     let mut claim_per_round = *claim;
@@ -291,7 +342,7 @@ impl<E: Engine> SumcheckProof<E> {
       let r_i = transcript.squeeze(b"c")?;
       r.push(r_i);
       polys.push(poly.compress());
-      decompress_and_evaluate_lc_poly(degree_bound, &mut lc_poly, r_i);
+      lc_builder.add_round(degree_bound, r_i);
 
       // Set up next round
       claim_per_round = poly.evaluate(&r_i);
@@ -306,6 +357,7 @@ impl<E: Engine> SumcheckProof<E> {
       info!(elapsed_ms = %round_t.elapsed().as_millis(), round = round, "sumcheck_quad_round");
     }
 
+    let lc_poly = lc_builder.finalize();
     Ok((
       SumcheckProof {
         compressed_polys: polys,
@@ -509,7 +561,7 @@ impl<E: Engine> SumcheckProof<E> {
     let degree_bound = 3;
 
     let mut r: Vec<E::Scalar> = Vec::new();
-    let mut lc_poly = vec![];
+    let mut lc_builder = LCPolyBuilder::new();
 
     let mut polys: Vec<CompressedUniPoly<E::Scalar>> = Vec::new();
     let mut claim_per_round = *claim;
@@ -546,7 +598,7 @@ impl<E: Engine> SumcheckProof<E> {
       let r_i = transcript.squeeze(b"c")?;
       r.push(r_i);
       polys.push(poly.compress());
-      decompress_and_evaluate_lc_poly(degree_bound, &mut lc_poly, r_i);
+      lc_builder.add_round(degree_bound, r_i);
 
       // Set up next round
       claim_per_round = poly.evaluate(&r_i);
@@ -571,6 +623,7 @@ impl<E: Engine> SumcheckProof<E> {
       info!(elapsed_ms = %round_t.elapsed().as_millis(), round = round, "sumcheck_round");
     }
 
+    let lc_poly = lc_builder.finalize();
     Ok((
       SumcheckProof {
         compressed_polys: polys,
